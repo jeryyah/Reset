@@ -175,6 +175,13 @@ export async function setTier(userId: number, tier: Tier): Promise<UserRecord> {
   return rowToRecord(updated[0]!);
 }
 
+export async function getAllUserIds(): Promise<number[]> {
+  const rows = await db
+    .select({ userId: botUsersTable.userId })
+    .from(botUsersTable);
+  return rows.map((r) => r.userId);
+}
+
 export async function incrementUsage(userId: number): Promise<UserRecord> {
   const current = await getOrCreateUser(userId);
   const updated = await db
