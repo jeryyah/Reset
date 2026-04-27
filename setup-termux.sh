@@ -157,12 +157,17 @@ pnpm install \
   --config.auto-install-peers=true \
   --config.strict-peer-dependencies=false
 
-# Pastikan dotenv-cli tersedia untuk run dengan .env
-if ! pnpm ls -w dotenv-cli >/dev/null 2>&1; then
-  log "Install dotenv-cli untuk load .env..."
-  pnpm add -w -D dotenv-cli
-fi
 ok "Dependency terpasang."
+
+# Helper: load .env ke environment shell saat ini (ganti dotenv-cli)
+load_env() {
+  if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$PROJECT_DIR/.env"
+    set +a
+  fi
+}
 
 # ==============================================================================
 # 7. Buat .env (interaktif)
@@ -198,13 +203,13 @@ fi
 # 8. Push schema database
 # ==============================================================================
 log "Push schema ke database..."
-if pnpm --filter @workspace/db run push 2>/dev/null; then
-  ok "Schema ter-push (via script 'push')."
-elif pnpm exec dotenv -e .env -- pnpm --filter @workspace/db exec drizzle-kit push 2>/dev/null; then
-  ok "Schema ter-push (via drizzle-kit push)."
+load_env
+if pnpm --filter @workspace/db exec drizzle-kit push; then
+  ok "Schema ter-push."
 else
-  warn "Push schema gagal otomatis. Coba manual:"
-  warn "  pnpm exec dotenv -e .env -- pnpm --filter @workspace/db exec drizzle-kit push"
+  warn "Push schema gagal otomatis. Coba manual setelah setup selesai:"
+  warn "  cd $PROJECT_DIR && set -a && . ./.env && set +a && \\"
+  warn "    pnpm --filter @workspace/db exec drizzle-kit push"
 fi
 
 # ==============================================================================
@@ -367,7 +372,8 @@ while true; do
     # Cek apakah perlu push schema (kalau folder lib/db berubah)
     if git diff --name-only "$LOCAL" "$REMOTE" 2>/dev/null | grep -q "^lib/db/"; then
       log "Schema DB berubah, push migration..."
-      pnpm exec dotenv -e .env -- pnpm --filter @workspace/db exec drizzle-kit push 2>&1 | tail -5 || \
+      ( set -a; . ./.env; set +a; \
+        pnpm --filter @workspace/db exec drizzle-kit push ) 2>&1 | tail -5 || \
         log "drizzle-kit push gagal — cek manual"
     fi
 
@@ -404,11 +410,12 @@ case "\${1:-status}" in
   status)         pm2 status ;;
   delete)         pm2 delete reset-bot reset-bot-updater 2>/dev/null || true ;;
   rebuild)        pnpm --filter @workspace/api-server run build && pm2 restart reset-bot ;;
+  db-push)        ( set -a; . ./.env; set +a; pnpm --filter @workspace/db exec drizzle-kit push ) ;;
   update)         bash scripts/auto-update.sh & echo "Manual update dipicu." ;;
   updater-logs)   pm2 logs reset-bot-updater ;;
   updater-stop)   pm2 stop reset-bot-updater ;;
   updater-start)  pm2 start reset-bot-updater ;;
-  *) echo "Usage: reset-bot {start|stop|restart|reload|logs|status|delete|rebuild|update|updater-logs|updater-stop|updater-start}"; exit 1 ;;
+  *) echo "Usage: reset-bot {start|stop|restart|reload|logs|status|delete|rebuild|db-push|update|updater-logs|updater-stop|updater-start}"; exit 1 ;;
 esac
 EOF
 chmod +x "$BIN_DIR/reset-bot"
