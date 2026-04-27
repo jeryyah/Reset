@@ -367,13 +367,38 @@ export function startTelegramBot(): void {
     }
   });
 
+  const userCommands = [
+    { command: "start", description: "🚀 Start the bot" },
+    { command: "status", description: "📊 Check your account & usage" },
+    { command: "help", description: "📚 How to use the bot" },
+  ];
+
+  const adminCommands = [
+    ...userCommands,
+    { command: "broadcast", description: "📢 Broadcast to all users (admin)" },
+  ];
+
   bot.start({
     drop_pending_updates: true,
-    onStart: (botInfo) => {
+    onStart: async (botInfo) => {
       logger.info(
         { username: botInfo.username, id: botInfo.id },
         "Telegram bot started",
       );
+      try {
+        // Default menu for everyone
+        await bot.api.setMyCommands(userCommands);
+        // Extended menu just for the admin chat
+        const adminId = Number(adminChatId);
+        if (Number.isFinite(adminId)) {
+          await bot.api.setMyCommands(adminCommands, {
+            scope: { type: "chat", chat_id: adminId },
+          });
+        }
+        logger.info("Bot commands menu registered");
+      } catch (err) {
+        logger.error({ err }, "Failed to register bot commands");
+      }
     },
   });
 }
