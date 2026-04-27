@@ -147,31 +147,13 @@ ok "Project ada di $PROJECT_DIR"
 cd "$PROJECT_DIR"
 
 # ==============================================================================
-# 5. Patch package.json & .npmrc agar ramah Termux
-# ==============================================================================
-log "Patch package.json (skip cek pnpm di preinstall)..."
-node -e "
-const fs = require('fs');
-const path = './package.json';
-const j = JSON.parse(fs.readFileSync(path, 'utf8'));
-j.scripts = j.scripts || {};
-j.scripts.preinstall = 'true';
-if (j.engines && j.engines.node) delete j.engines.node;
-fs.writeFileSync(path, JSON.stringify(j, null, 2) + '\n');
-console.log('package.json dipatch');
-"
-
-log "Tambah konfigurasi .npmrc..."
-touch .npmrc
-grep -q '^node-linker' .npmrc || echo 'node-linker=hoisted' >> .npmrc
-grep -q '^strict-peer-dependencies' .npmrc || echo 'strict-peer-dependencies=false' >> .npmrc
-grep -q '^auto-install-peers' .npmrc || echo 'auto-install-peers=true' >> .npmrc
-
-# ==============================================================================
-# 6. Install dependency project
+# 5. Install dependency project (pakai flag, jangan modif file tracked)
 # ==============================================================================
 log "Install dependency (ini bisa lama di HP, sabar ya)..."
-pnpm install
+pnpm install \
+  --config.node-linker=hoisted \
+  --config.auto-install-peers=true \
+  --config.strict-peer-dependencies=false
 
 # Pastikan dotenv-cli tersedia untuk run dengan .env
 if ! pnpm ls -w dotenv-cli >/dev/null 2>&1; then
@@ -199,6 +181,10 @@ PORT=$PORT_IN
 DATABASE_URL=postgres://$PG_USER@localhost:5432/$DB_NAME
 TELEGRAM_BOT_TOKEN=$TG_TOKEN
 ADMIN_CHAT_ID=$ADMIN_ID
+
+# Auto-update settings (cek commit baru di GitHub setiap N detik)
+UPDATE_INTERVAL_SEC=300
+GIT_BRANCH=main
 EOF
   chmod 600 "$ENV_FILE"
   ok ".env dibuat."
@@ -286,30 +272,141 @@ module.exports = {
       merge_logs: true,
       time: true,
     },
+    {
+      name: 'reset-bot-updater',
+      cwd: __dirname,
+      script: 'scripts/auto-update.sh',
+      interpreter: 'bash',
+      env: {
+        ...env,
+        UPDATE_INTERVAL_SEC: env.UPDATE_INTERVAL_SEC || '300',
+        GIT_BRANCH: env.GIT_BRANCH || 'main',
+      },
+      autorestart: true,
+      restart_delay: 10000,
+      max_restarts: 20,
+      out_file: 'logs/updater.out.log',
+      error_file: 'logs/updater.err.log',
+      merge_logs: true,
+      time: true,
+    },
   ],
 };
 PMEOF
-mkdir -p "$PROJECT_DIR/logs"
+mkdir -p "$PROJECT_DIR/logs" "$PROJECT_DIR/scripts"
 ok "ecosystem.config.cjs siap."
+
+# ==============================================================================
+# 10b. Auto-update script (poll GitHub tiap N detik, pull + rebuild + restart)
+# ==============================================================================
+log "Buat scripts/auto-update.sh..."
+cat > "$PROJECT_DIR/scripts/auto-update.sh" <<'AUEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# Auto-update worker untuk reset-bot.
+# Cek commit baru di branch GIT_BRANCH tiap UPDATE_INTERVAL_SEC detik.
+# Kalau ada commit baru: pull, install (kalau lockfile berubah), rebuild, restart.
+
+set -u
+cd "$(dirname "$0")/.."
+
+INTERVAL="${UPDATE_INTERVAL_SEC:-300}"
+BRANCH="${GIT_BRANCH:-main}"
+LOG_PREFIX="[updater]"
+
+log() { echo "$(date -Iseconds) $LOG_PREFIX $*"; }
+
+# Pastikan PATH punya pnpm/pm2/node walau dijalankan dari PM2
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PREFIX/bin:$PATH"
+
+log "Started. branch=$BRANCH interval=${INTERVAL}s repo=$(pwd)"
+
+while true; do
+  # fetch tanpa output
+  if ! git fetch origin "$BRANCH" --quiet 2>/dev/null; then
+    log "git fetch failed, retry in ${INTERVAL}s"
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "")
+  REMOTE=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+
+  if [ -z "$REMOTE" ]; then
+    log "Tidak bisa baca origin/$BRANCH, skip."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  if [ "$LOCAL" != "$REMOTE" ]; then
+    log "Commit baru terdeteksi: $LOCAL -> $REMOTE"
+
+    OLD_LOCK_HASH=""
+    [ -f pnpm-lock.yaml ] && OLD_LOCK_HASH=$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)
+
+    # Stash local changes (kalau ada), hard reset ke remote
+    git stash push --include-untracked -m "auto-update-$(date +%s)" >/dev/null 2>&1 || true
+    if ! git reset --hard "origin/$BRANCH"; then
+      log "git reset gagal, skip update kali ini."
+      sleep "$INTERVAL"
+      continue
+    fi
+
+    NEW_LOCK_HASH=""
+    [ -f pnpm-lock.yaml ] && NEW_LOCK_HASH=$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)
+
+    if [ "$OLD_LOCK_HASH" != "$NEW_LOCK_HASH" ]; then
+      log "Lockfile berubah, install ulang dependency..."
+      pnpm install \
+        --config.node-linker=hoisted \
+        --config.auto-install-peers=true \
+        --config.strict-peer-dependencies=false || log "pnpm install gagal"
+    fi
+
+    # Cek apakah perlu push schema (kalau folder lib/db berubah)
+    if git diff --name-only "$LOCAL" "$REMOTE" 2>/dev/null | grep -q "^lib/db/"; then
+      log "Schema DB berubah, push migration..."
+      pnpm exec dotenv -e .env -- pnpm --filter @workspace/db exec drizzle-kit push 2>&1 | tail -5 || \
+        log "drizzle-kit push gagal — cek manual"
+    fi
+
+    log "Build api-server..."
+    if pnpm --filter @workspace/api-server run build; then
+      log "Restart reset-bot via PM2..."
+      pm2 restart reset-bot --update-env || log "pm2 restart gagal"
+      log "✅ Update selesai (commit $REMOTE)"
+    else
+      log "❌ Build gagal, bot TIDAK di-restart. Tetap di commit lama secara runtime."
+    fi
+  fi
+
+  sleep "$INTERVAL"
+done
+AUEOF
+chmod +x "$PROJECT_DIR/scripts/auto-update.sh"
+ok "Auto-update worker terpasang (cek tiap 5 menit, atur via UPDATE_INTERVAL_SEC)."
 
 # Wrapper command supaya gampang dipakai
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/reset-bot" <<EOF
 #!/data/data/com.termux/files/usr/bin/bash
-# Helper command: 'reset-bot start|stop|restart|logs|status'
+# Helper command: 'reset-bot <perintah>'
 set -e
 cd "$PROJECT_DIR"
 case "\${1:-status}" in
-  start)   pm2 start ecosystem.config.cjs ;;
-  stop)    pm2 stop reset-bot ;;
-  restart) pm2 restart reset-bot ;;
-  reload)  pm2 reload reset-bot ;;
-  logs)    pm2 logs reset-bot ;;
-  status)  pm2 status ;;
-  delete)  pm2 delete reset-bot ;;
-  rebuild) pnpm --filter @workspace/api-server run build && pm2 restart reset-bot ;;
-  *) echo "Usage: reset-bot {start|stop|restart|reload|logs|status|delete|rebuild}"; exit 1 ;;
+  start)          pm2 start ecosystem.config.cjs ;;
+  stop)           pm2 stop reset-bot ;;
+  restart)        pm2 restart reset-bot ;;
+  reload)         pm2 reload reset-bot ;;
+  logs)           pm2 logs reset-bot ;;
+  status)         pm2 status ;;
+  delete)         pm2 delete reset-bot reset-bot-updater 2>/dev/null || true ;;
+  rebuild)        pnpm --filter @workspace/api-server run build && pm2 restart reset-bot ;;
+  update)         bash scripts/auto-update.sh & echo "Manual update dipicu." ;;
+  updater-logs)   pm2 logs reset-bot-updater ;;
+  updater-stop)   pm2 stop reset-bot-updater ;;
+  updater-start)  pm2 start reset-bot-updater ;;
+  *) echo "Usage: reset-bot {start|stop|restart|reload|logs|status|delete|rebuild|update|updater-logs|updater-stop|updater-start}"; exit 1 ;;
 esac
 EOF
 chmod +x "$BIN_DIR/reset-bot"
@@ -368,19 +465,30 @@ ${GRN}  SETUP SELESAI 🎉${RST}
 ${GRN}========================================================================${RST}
 
 Bot SUDAH JALAN via PM2 (otomatis restart kalau crash).
+Auto-updater juga aktif: cek commit baru di GitHub tiap 5 menit, lalu
+otomatis pull → install → build → restart bot.
 
 Perintah cepat (pakai 'reset-bot'):
-  reset-bot status     # cek status
-  reset-bot logs       # lihat log realtime
-  reset-bot restart    # restart bot
-  reset-bot stop       # stop bot
-  reset-bot rebuild    # build ulang lalu restart
-  reset-bot start      # start lagi kalau di-stop
+  reset-bot status         # cek status semua proses
+  reset-bot logs           # log bot realtime
+  reset-bot restart        # restart bot
+  reset-bot stop           # stop bot
+  reset-bot rebuild        # build ulang lalu restart
+  reset-bot start          # start lagi kalau di-stop
+
+  reset-bot update         # PAKSA cek update sekarang (tidak nunggu 5 menit)
+  reset-bot updater-logs   # lihat log auto-updater
+  reset-bot updater-stop   # matikan auto-updater (kalau mau pause)
+  reset-bot updater-start  # nyalakan lagi auto-updater
 
 Atau manual via PM2:
   pm2 list
   pm2 logs reset-bot
   pm2 monit
+
+Ubah interval auto-update (default 300 detik = 5 menit):
+  nano $ENV_FILE      # edit UPDATE_INTERVAL_SEC
+  reset-bot updater-stop && reset-bot updater-start
 
 Cek health endpoint:
   curl http://localhost:\$(grep ^PORT= $ENV_FILE | cut -d= -f2)/api/healthz
