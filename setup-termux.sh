@@ -60,8 +60,10 @@ require_termux
 # 1. Update & install paket sistem
 # ==============================================================================
 log "Update paket Termux..."
-yes | pkg update -y >/dev/null
-yes | pkg upgrade -y >/dev/null
+export DEBIAN_FRONTEND=noninteractive
+# NOTE: jangan pakai 'yes |' di sini — bikin pipefail trigger exit.
+pkg update -y </dev/null || warn "pkg update warning (lanjut)"
+pkg upgrade -y -o Dpkg::Options::="--force-confnew" </dev/null || warn "pkg upgrade warning (lanjut)"
 
 log "Install paket sistem yang diperlukan..."
 pkg install -y \
@@ -70,7 +72,7 @@ pkg install -y \
   python build-essential clang make pkg-config \
   postgresql \
   openssl libjansson \
-  tmux >/dev/null
+  tmux </dev/null
 
 ok "Paket sistem terpasang."
 log "Versi Node: $(node -v)"
