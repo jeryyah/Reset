@@ -258,10 +258,9 @@ export function formatSuccess(input: {
   key: string;
   now?: Date;
 }): string {
-  const { speedMs, used, limit, key } = input;
+  const { used, limit, key } = input;
   const now = input.now ?? new Date();
   const time = formatBangladeshTime12(now);
-  const speedLabel = speedMs < 2000 ? "✅ Fast" : "🟡 Normal";
   const usageStr = Number.isFinite(limit) ? `${used}/${limit}` : `${used} (Unlimited)`;
 
   return [
@@ -271,7 +270,6 @@ export function formatSuccess(input: {
     "",
     "🎯 Operation Complete",
     "├ Status: 🟢 Success",
-    `├ Speed: ${speedLabel} (${speedMs}ms)`,
     `├ Time: ${time}`,
     `└ Usage: ${usageStr}`,
     "",
