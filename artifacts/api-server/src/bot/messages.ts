@@ -261,7 +261,7 @@ export function formatSuccess(input: {
   const { speedMs, used, limit, key } = input;
   const now = input.now ?? new Date();
   const time = formatBangladeshTime12(now);
-  const speedLabel = speedMs < 2000 ? "✅ Fast" : speedMs < 5000 ? "🟡 Normal" : "🔴 Slow";
+  const speedLabel = speedMs < 2000 ? "✅ Fast" : "🟡 Normal";
   const usageStr = Number.isFinite(limit) ? `${used}/${limit}` : `${used} (Unlimited)`;
 
   return [
